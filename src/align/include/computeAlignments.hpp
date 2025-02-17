@@ -584,6 +584,7 @@ void writer_thread(const std::string& output_file,
 }
 
 void computeAlignments() {
+    /*
     std::atomic<size_t> total_alignments_queued(0);
     std::atomic<bool> reader_done(false);
     std::atomic<bool> processor_done(false);
@@ -592,14 +593,19 @@ void computeAlignments() {
     atomic_queue::AtomicQueue<std::string*, 1024> line_queue;
     seq_atomic_queue_t seq_queue;
     paf_atomic_queue_t paf_queue;  // Add this line
+    */
 
     // Calculate max_processors based on the number of worker threads
     size_t max_processors = std::max(1UL, static_cast<unsigned long>(param.threads));
 
     // Calculate total alignment length
+    // TODO: Avoid reading the whole file twice
     uint64_t total_alignment_length = 0;
     {
         std::ifstream mappingListStream(param.mashmapPafFile);
+        if (!mappingListStream.is_open()) {
+            throw std::runtime_error("[wfmash::align] Error! Failed to open input mapping file: " + param.mashmapPafFile);
+        }
         std::string mappingRecordLine;
         MappingBoundaryRow currentRecord;
 
@@ -610,6 +616,102 @@ void computeAlignments() {
             }
         }
     }
+
+    // Create progress meter
+    progress_meter::ProgressMeter progress(total_alignment_length, "[wfmash::align] aligned");
+
+    // (1) Single reader thread
+    std::ifstream mappingListStream(param.mashmapPafFile);
+    if (!mappingListStream.is_open()) {
+        throw std::runtime_error("[wfmash::align] Error! Failed to open input mapping file: " + param.mashmapPafFile);
+    }
+
+    std::ofstream outstream(param.pafOutputFile);
+    // if the output file is SAM, we write the header
+    if (param.sam_format) {
+        write_sam_header(outstream);
+    }
+
+    if (!outstream.is_open()) {
+        throw std::runtime_error("[wfmash::align] Error! Failed to open output file: " + param.pafOutputFile);
+    }
+
+
+    faidx_t* local_ref_faidx = fai_load(param.refSequences.front().c_str());
+    faidx_t* local_query_faidx = fai_load(param.querySequences.front().c_str());
+    std::string line;
+    while (std::getline(mappingListStream, line)) {
+        if (!line.empty()) {
+            // (2) Processor thread
+            MappingBoundaryRow currentRecord;
+            parseMashmapRow(line, currentRecord, param.target_padding);
+            seq_record_t* rec = createSeqRecord(currentRecord, line, local_ref_faidx, local_query_faidx);
+
+            // (3) worker_thread
+
+            std::string alignment_output = processAlignment(rec);
+
+            // Parse the alignment output to find CIGAR string and coordinates
+            std::stringstream ss(alignment_output);
+            std::string line;
+            while (std::getline(ss, line)) {
+                if (line.empty()) continue;
+
+                std::vector<std::string> fields;
+                std::stringstream field_ss(line);
+                std::string field;
+                while (field_ss >> field) {
+                    fields.push_back(field);
+                }
+
+                // Find the CIGAR string field (should be after cg:Z:)
+                auto cigar_it = std::find_if(fields.begin(), fields.end(),
+                    [](const std::string& s) { return s.substr(0, 5) == "cg:Z:"; });
+
+                std::string paf_str;
+                if (cigar_it != fields.end()) {
+                    std::string cigar = cigar_it->substr(5); // Remove cg:Z: prefix
+                    uint64_t ref_start = std::stoull(fields[7]);
+                    uint64_t ref_end = std::stoull(fields[8]);
+
+
+                    // Just pass through the CIGAR string and coordinates unchanged
+                    // The trimming is now handled in wflign namespace
+
+                    // Reconstruct the line
+                    std::string new_line;
+                    for (const auto& f : fields) {
+                        if (!new_line.empty()) new_line += '\t';
+                        new_line += f;
+                    }
+                    new_line += '\n';
+
+                    // Push the modified alignment output to the paf_queue
+                    paf_str = std::string(std::move(new_line));
+                } else {
+                    // If no CIGAR string found, output the line unchanged
+                    paf_str = std::string(line + '\n');
+                }
+                outstream << paf_str;
+                outstream.flush();
+            }
+            uint64_t alignment_length = rec->currentRecord.qEndPos - rec->currentRecord.qStartPos;
+            progress.increment(alignment_length);
+            delete rec;
+        }
+    }
+
+    mappingListStream.close();
+    progress.finish();
+
+    std::cerr << "[wfmash::align] "
+              << "total aligned records = " << total_alignments_queued.load()
+              << ", total aligned bp = " << processed_alignment_length.load()
+              << ", time taken = " << duration.count() << " seconds" << std::endl;
+
+    // ----
+
+/*
 
     // Create progress meter
     progress_meter::ProgressMeter progress(total_alignment_length, "[wfmash::align] aligned");
@@ -663,10 +765,10 @@ void computeAlignments() {
               << "total aligned records = " << total_alignments_queued.load() 
               << ", total aligned bp = " << processed_alignment_length.load()
               << ", time taken = " << duration.count() << " seconds" << std::endl;
-}
-      
-  };
-}
+*/
+} // computeAlignments
+}; // Aligner class
+} // namespace align
 
 
 #endif
